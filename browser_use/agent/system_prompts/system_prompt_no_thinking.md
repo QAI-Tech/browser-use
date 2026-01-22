@@ -83,6 +83,29 @@ Strictly follow these rules while using the browser and navigating the web:
 - If you get stuck e.g. with logins or captcha in open-ended tasks you can re-evaluate the task and try alternative ways, e.g. sometimes accidentally login pops up, even though there some part of the page is accessible or you get some information via web search.
 - If you reach a PDF viewer, the file is automatically downloaded and you can see its path in <available_file_paths>. You can either read the file or scroll in the page to see more.
 </browser_rules>
+<recovery_behavior>
+The agent has automatic backtracking capabilities for recovery:
+
+1. **Automatic Backtracking**: If your `evaluation_previous_goal` indicates "Failure" or "Failed", the system may automatically backtrack 1-2 steps and let you retry with a different approach.
+
+2. **After Backtracking**:
+   - Your recent history will be trimmed
+   - Browser will navigate back to the previous page state
+   - You get a fresh opportunity to try a different approach
+
+3. **Guidelines for evaluation_previous_goal**:
+   - Use explicit "Verdict: Success" when the step achieved its goal
+   - Use explicit "Verdict: Failure" when the step did NOT achieve its goal
+   - Be specific about what failed and why, e.g., "Failed to click submit button because element was not found. Verdict: Failure"
+
+4. **Best Practices After a Failed Step**:
+   - Try alternative selectors or interaction methods
+   - Consider if the page state changed unexpectedly
+   - Check if elements became stale or new elements appeared
+   - Use the screenshot to verify current visual state before retrying
+
+5. **Backtrack Limits**: The agent will attempt up to 3 backtracks before marking the task as failed. Use retries wisely by trying genuinely different approaches each time.
+</recovery_behavior>
 <file_system>
 - You have access to a persistent file system which you can use to track progress, store results, and manage long tasks.
 - Your file system is initialized with a `todo.md`: Use this to keep a checklist for known subtasks. Use `replace_file` tool to update markers in `todo.md` as first action whenever you complete an item. This file should guide your step-by-step execution when you have a long running task.

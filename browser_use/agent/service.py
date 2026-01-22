@@ -44,6 +44,7 @@ from browser_use.agent.message_manager.service import (
 	MessageManager,
 )
 from browser_use.agent.prompts import SystemPrompt
+from browser_use.browser.events import GoBackEvent
 from browser_use.agent.views import (
 	ActionResult,
 	AgentError,
@@ -1104,21 +1105,33 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		self.state.last_result = result
 
 	async def _post_process(self) -> None:
-		"""Handle post-action processing like download tracking and result logging"""
+		"""Handle post-action processing like download tracking, result logging, and backtracking"""
 		assert self.browser_session is not None, 'BrowserSession is not set up'
 
 		# Check for new downloads after executing actions
 		await self._check_and_update_downloads('after executing actions')
 
-		# check for action errors  and len more than 1
+		# check for action errors and len more than 1
 		if self.state.last_result and len(self.state.last_result) == 1 and self.state.last_result[-1].error:
 			self.state.consecutive_failures += 1
 			self.logger.debug(f'🔄 Step {self.state.n_steps}: Consecutive failures: {self.state.consecutive_failures}')
+
+			# Check if we should backtrack instead of just continuing with failure
+			should_backtrack, reason = await self._should_trigger_backtrack()
+			if should_backtrack:
+				await self._perform_backtrack(reason)
 			return
 
 		if self.state.consecutive_failures > 0:
 			self.state.consecutive_failures = 0
 			self.logger.debug(f'🔄 Step {self.state.n_steps}: Consecutive failures reset to: {self.state.consecutive_failures}')
+
+		# Check for goal-based backtracking (even without action errors)
+		# This triggers when LLM evaluates that previous goal was not achieved
+		should_backtrack, reason = await self._should_trigger_backtrack()
+		if should_backtrack:
+			await self._perform_backtrack(reason)
+			return
 
 		# Log completion results
 		if self.state.last_result and len(self.state.last_result) > 0 and self.state.last_result[-1].is_done:
@@ -1165,6 +1178,108 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		await self._demo_mode_log(f'Step error: {error_msg}', 'error', {'step': self.state.n_steps})
 		self.state.last_result = [ActionResult(error=error_msg)]
 		return None
+
+	async def _should_trigger_backtrack(self) -> tuple[bool, str]:
+		"""
+		Check if backtracking should be triggered based on LLM evaluation.
+
+		Returns:
+			tuple[bool, str]: (should_backtrack, reason)
+		"""
+		if not self.settings.enable_backtracking:
+			return False, ''
+
+		# Check if we've exhausted backtrack attempts
+		if self.state.backtrack_attempts >= self.settings.max_backtrack_attempts:
+			self.logger.debug(f'Max backtrack attempts ({self.settings.max_backtrack_attempts}) reached')
+			return False, ''
+
+		# Don't backtrack on the first step or right after a backtrack
+		if self.state.n_steps <= 1 or self.state.n_steps <= self.state.last_backtrack_step + 1:
+			return False, ''
+
+		# Get the evaluation from current model output
+		model_output = self.state.last_model_output
+		if model_output is None:
+			return False, ''
+
+		# Check evaluation_previous_goal for failure indicators
+		evaluation = (model_output.current_state.evaluation_previous_goal or '').lower()
+
+		# Trigger on explicit failure
+		if 'failure' in evaluation or 'failed' in evaluation:
+			return True, 'goal_failure'
+		if 'unexpected' in evaluation or 'not as expected' in evaluation:
+			return True, 'expected_mismatch'
+
+		return False, ''
+
+	async def _perform_backtrack(self, reason: str) -> None:
+		"""
+		Perform backtrack operation:
+		1. Trim agent history and message manager history
+		2. Navigate browser back
+		3. Reset failure counters
+		4. Record backtrack event
+		"""
+		steps_to_remove = min(self.settings.backtrack_steps, len(self.history.history) - 1)
+
+		if steps_to_remove < 1:
+			self.logger.warning('Cannot backtrack: insufficient history')
+			return
+
+		self.logger.info(f'🔄 Backtracking {steps_to_remove} step(s). Reason: {reason}')
+
+		# 1. Trim AgentHistoryList
+		if steps_to_remove >= len(self.history.history):
+			self.history.history = self.history.history[:1]
+		else:
+			self.history.history = self.history.history[:-steps_to_remove]
+
+		# 2. Trim MessageManager history items
+		hist_items = self._message_manager.state.agent_history_items
+		if steps_to_remove >= len(hist_items):
+			self._message_manager.state.agent_history_items = hist_items[:1] if hist_items else []
+		else:
+			self._message_manager.state.agent_history_items = hist_items[:-steps_to_remove]
+
+		# 3. Navigate browser back (if enabled)
+		if self.settings.backtrack_browser_history and self.browser_session:
+			for i in range(steps_to_remove):
+				try:
+					event = self.browser_session.event_bus.dispatch(GoBackEvent())
+					await event
+					await asyncio.sleep(0.5)  # Brief pause for page to load
+					self.logger.debug(f'Browser navigated back ({i + 1}/{steps_to_remove})')
+				except Exception as e:
+					self.logger.warning(f'Browser go_back failed: {e}')
+					break
+
+		# 4. Reset state
+		self.state.consecutive_failures = 0
+		self.state.backtrack_attempts += 1
+		self.state.last_backtrack_step = self.state.n_steps
+
+		# 5. Adjust step counter (go back in history)
+		self.state.n_steps = max(1, self.state.n_steps - steps_to_remove)
+
+		# 6. Record backtrack for debugging
+		self.state.backtrack_history.append({
+			'step': self.state.n_steps,
+			'reason': reason,
+			'removed': steps_to_remove,
+			'attempt': self.state.backtrack_attempts,
+			'timestamp': time.time(),
+		})
+
+		# 7. Clear last model output and result so next step starts fresh
+		self.state.last_model_output = None
+		self.state.last_result = None
+
+		self.logger.info(
+			f'✅ Backtrack complete. Now at step {self.state.n_steps}. '
+			f'Attempts: {self.state.backtrack_attempts}/{self.settings.max_backtrack_attempts}'
+		)
 
 	async def _finalize(self, browser_state_summary: BrowserStateSummary | None) -> None:
 		"""Finalize the step with history, logging, and events"""
@@ -2236,13 +2351,29 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 					await self._external_pause_event.wait()
 					signal_handler.reset()
 
-				# Check if we should stop due to too many failures, if final_response_after_failure is True, we try one last time
-				if (self.state.consecutive_failures) >= self.settings.max_failures + int(
-					self.settings.final_response_after_failure
-				):
-					self.logger.error(f'❌ Stopping due to {self.settings.max_failures} consecutive failures')
-					agent_run_error = f'Stopped due to {self.settings.max_failures} consecutive failures'
-					break
+				# Check if we should stop due to too many failures
+				# Only stop if both consecutive failures AND backtrack attempts are exhausted
+				max_total_failures = self.settings.max_failures + int(self.settings.final_response_after_failure)
+				if self.state.consecutive_failures >= max_total_failures:
+					# If backtracking is enabled, check if we've exhausted all backtrack attempts
+					if self.settings.enable_backtracking and self.state.backtrack_attempts < self.settings.max_backtrack_attempts:
+						# Still have backtrack attempts left, the backtracking logic in _post_process will handle it
+						pass
+					else:
+						# No more retries available
+						if self.state.backtrack_attempts > 0:
+							self.logger.error(
+								f'❌ Task failed after {self.state.backtrack_attempts} backtrack attempts '
+								f'and {self.settings.max_failures} consecutive failures'
+							)
+							agent_run_error = (
+								f'Failed after {self.state.backtrack_attempts} backtrack attempts '
+								f'and {self.settings.max_failures} consecutive failures'
+							)
+						else:
+							self.logger.error(f'❌ Stopping due to {self.settings.max_failures} consecutive failures')
+							agent_run_error = f'Stopped due to {self.settings.max_failures} consecutive failures'
+						break
 
 				# Check control flags before each step
 				if self.state.stopped:
