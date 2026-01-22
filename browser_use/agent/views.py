@@ -55,6 +55,12 @@ class AgentSettings(BaseModel):
 	step_timeout: int = 180  # Timeout in seconds for each step
 	final_response_after_failure: bool = True  # If True, attempt one final recovery call after max_failures
 
+	# Backtracking configuration
+	enable_backtracking: bool = True  # Enable/disable backtracking feature
+	max_backtrack_attempts: int = 3  # Maximum total backtrack attempts before giving up
+	backtrack_steps: int = 1  # Number of steps to go back (1-2)
+	backtrack_browser_history: bool = True  # Whether to navigate browser back
+
 
 class AgentState(BaseModel):
 	"""Holds all state information for an Agent"""
@@ -73,6 +79,11 @@ class AgentState(BaseModel):
 	stopped: bool = False
 	session_initialized: bool = False  # Track if session events have been dispatched
 	follow_up_task: bool = False  # Track if the agent is a follow-up task
+
+	# Backtracking state
+	backtrack_attempts: int = 0  # Total backtrack attempts made
+	last_backtrack_step: int = 0  # Step number when last backtrack occurred
+	backtrack_history: list[dict] = Field(default_factory=list)  # Log of backtracks
 
 	message_manager_state: MessageManagerState = Field(default_factory=MessageManagerState)
 	file_system_state: FileSystemState | None = None
