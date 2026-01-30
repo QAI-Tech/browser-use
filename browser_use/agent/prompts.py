@@ -23,12 +23,14 @@ class SystemPrompt:
 		flash_mode: bool = False,
 		is_anthropic: bool = False,
 		is_browser_use_model: bool = False,
+		goal_driven_mode: bool = False,
 	):
 		self.max_actions_per_step = max_actions_per_step
 		self.use_thinking = use_thinking
 		self.flash_mode = flash_mode
 		self.is_anthropic = is_anthropic
 		self.is_browser_use_model = is_browser_use_model
+		self.goal_driven_mode = goal_driven_mode
 		prompt = ''
 		if override_system_message is not None:
 			prompt = override_system_message
@@ -45,8 +47,16 @@ class SystemPrompt:
 		"""Load the prompt template from the markdown file."""
 		try:
 			# Choose the appropriate template based on model type and mode
+			# Goal-driven mode uses specialized prompts for autonomous navigation
+			if self.goal_driven_mode:
+				if self.flash_mode and self.is_anthropic:
+					template_filename = 'system_prompt_goal_driven_flash_anthropic.md'
+				elif self.flash_mode:
+					template_filename = 'system_prompt_goal_driven_flash.md'
+				else:
+					template_filename = 'system_prompt_goal_driven.md'
 			# Browser-use models use simplified prompts optimized for fine-tuned models
-			if self.is_browser_use_model:
+			elif self.is_browser_use_model:
 				if self.flash_mode:
 					template_filename = 'system_prompt_browser_use_flash.md'
 				elif self.use_thinking:
